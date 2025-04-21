@@ -1,0 +1,142 @@
+# ride_services.py
+import psycopg2
+from psycopg2 import sql
+
+
+def request_ride(rider_id: int, pickup_loc_id: int, dropoff_loc_id: int, ride_type: str):
+    """
+    Atomic ride request with concurrency control
+    """
+    conn = psycopg2.connect(dbname="rideapp2", user="postgres", password="postgres")
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # 1. Begin transaction
+                conn.set_session(isolation_level="SERIALIZABLE")
+
+                # 2. Create ride request (locked for update)
+                cur.execute(
+                    """
+                    INSERT INTO ride_requests 
+                        (rider_id, pickup_location_id, dropoff_location_id, ride_type)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING request_id
+                    """,
+                    (rider_id, pickup_loc_id, dropoff_loc_id, ride_type)
+                )
+                request_id = cur.fetchone()[0]
+
+                # 3. Find available drivers (with SKIP LOCKED to prevent blocking)
+                cur.execute(
+                    """
+                    SELECT d.driver_id, v.type, 
+                           ST_Distance(
+                               ST_MakePoint(l.longitude, l.latitude)::geography,
+                               (SELECT ST_MakePoint(longitude, latitude)::geography 
+                                FROM locations WHERE location_id = %s)
+                           )/1000 AS distance_km
+                    FROM drivers d
+                    JOIN vehicles v ON d.driver_id = v.driver_id
+                    JOIN locations l ON d.driver_id = l.user_id
+                    WHERE d.status = 'online'
+                    AND l.timestamp > NOW() - INTERVAL '5 minutes'
+                    ORDER BY distance_km
+                    LIMIT 5
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    (pickup_loc_id,)
+                )
+                available_drivers = cur.fetchall()
+
+                if not available_drivers:
+                    raise Exception("No available drivers")
+
+                # 4. Select nearest driver
+                driver_id, vehicle_type, distance = available_drivers[0]
+
+                # 5. Create ride record
+                cur.execute(
+                    """
+                    INSERT INTO rides (
+                        rider_id, driver_id, pickup_location_id, 
+                        dropoff_location_id, status, distance
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING ride_id
+                    """,
+                    (rider_id, driver_id, pickup_loc_id, dropoff_loc_id, 'accepted', distance)
+                )
+                ride_id = cur.fetchone()[0]
+
+                # 6. Update driver status
+                cur.execute(
+                    "UPDATE drivers SET status = 'busy' WHERE driver_id = %s",
+                    (driver_id,)
+                )
+
+                # 7. Update ride request status
+                cur.execute(
+                    "UPDATE ride_requests SET status = 'matched' WHERE request_id = %s",
+                    (request_id,)
+                )
+
+                return {
+                    "ride_id": ride_id,
+                    "driver_id": driver_id,
+                    "vehicle_type": vehicle_type,
+                    "distance_km": round(distance, 2)
+                }
+
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+
+def accept_ride(driver_id: int, ride_id: int):
+    """
+    Driver accepts a ride with proper locking
+    """
+    conn = psycopg2.connect(dbname="rideapp2", user="postgres", password="postgres")
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # 1. Lock ride record
+                cur.execute(
+                    """
+                    SELECT status FROM rides 
+                    WHERE ride_id = %s 
+                    FOR UPDATE
+                    """,
+                    (ride_id,)
+                )
+                ride_status = cur.fetchone()[0]
+
+                if ride_status != 'requested':
+                    raise Exception("Ride already processed")
+
+                # 2. Update ride status
+                cur.execute(
+                    """
+                    UPDATE rides 
+                    SET status = 'accepted', 
+                        driver_id = %s,
+                        start_time = NOW()
+                    WHERE ride_id = %s
+                    """,
+                    (driver_id, ride_id)
+                )
+
+                # 3. Update driver status
+                cur.execute(
+                    "UPDATE drivers SET status = 'busy' WHERE driver_id = %s",
+                    (driver_id,)
+                )
+
+                return {"status": "accepted", "ride_id": ride_id}
+
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
