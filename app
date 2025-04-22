@@ -1,4 +1,4 @@
-# app.py
+
 from flask import Flask, request, jsonify
 from ride_services import request_ride, accept_ride
 
